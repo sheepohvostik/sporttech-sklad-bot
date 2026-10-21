@@ -33,7 +33,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import avail as A
 import sheets as S
 from avail import BookingError, Index, key_str, nk, plan_take, remaining, type_key, type_label
-from labels import make_label, make_pdf
+from labels import make_label, make_pdf, size_text
 from sheets import Sheets
 
 logging.basicConfig(level=logging.INFO)
@@ -66,8 +66,9 @@ BTN_MINE = "📦 За мной числится"
 BTN_CART = "📋 Отсканировано сейчас"
 BTN_AVAIL = "📅 Доступность"
 BTN_BOOKS = "🔖 Мои брони"
+BTN_SCAN = "📷 Отсканировать оборудование"
 INV_RE = re.compile(r"^[A-Za-z]{2,5}-\d{1,6}$")
-MENU = {BTN_NEW, BTN_MANUAL, BTN_MINE, BTN_CART, BTN_AVAIL, BTN_BOOKS}
+MENU = {BTN_SCAN, BTN_NEW, BTN_MANUAL, BTN_MINE, BTN_CART, BTN_AVAIL, BTN_BOOKS}
 DATE_RE = re.compile(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}")
 
 sheets: Sheets = None
@@ -138,8 +139,10 @@ NEW_STEPS = [  # (ключ, вопрос, можно пропустить)
 # ------------------------------------------------------------------ помощники
 def main_kb():
     rows = []
-    if SCANNER_URL:
-        rows.append([KeyboardButton(text="📷 Сканировать", web_app=WebAppInfo(url=SCANNER_URL))])
+    if SCANNER_URL:  # камера открывается прямо в Telegram
+        rows.append([KeyboardButton(text=BTN_SCAN, web_app=WebAppInfo(url=SCANNER_URL))])
+    else:            # без сканера-страницы: бот примет фото QR-кода
+        rows.append([KeyboardButton(text=BTN_SCAN)])
     rows.append([KeyboardButton(text=BTN_CART), KeyboardButton(text=BTN_MINE)])
     rows.append([KeyboardButton(text=BTN_AVAIL), KeyboardButton(text=BTN_BOOKS)])
     rows.append([KeyboardButton(text=BTN_MANUAL), KeyboardButton(text=BTN_NEW)])
@@ -147,8 +150,7 @@ def main_kb():
 
 
 def menu_hint():
-    return ("" if SCANNER_URL else
-            "\n\nСканируйте QR на оборудовании камерой телефона: оно добавится в ваш список.")
+    return "\n\nНажмите «" + BTN_SCAN + "», чтобы добавить оборудование в список."
 
 
 def cancel_row(kb: InlineKeyboardBuilder):
@@ -467,7 +469,8 @@ async def add_to_cart(m: Message, uid: int, raws):
     save_state()
     note = []
     if added:
-        note.append("Добавлено: " + ", ".join(added))
+        note.append("✅ Отсканировано и добавлено в список:\n" +
+                    "\n".join(f"• {i} — {found[i][S.NAME]}" for i in added))
     if missing:
         note.append("Не найдено в таблице: " + ", ".join(missing))
     if not added and not missing:
@@ -637,6 +640,73 @@ async def cancel_cmd(m: Message, state: FSMContext, emp):
     await m.answer("Отменено.", reply_markup=main_kb())
 
 
+def decode_qr_photo(raw: bytes):
+    """Все QR-коды на фото (нужен необязательный пакет opencv-python-headless)."""
+    import cv2
+    import numpy as np
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+    dets = []
+    if hasattr(cv2, "QRCodeDetectorAruco"):
+        dets.append(cv2.QRCodeDetectorAruco())
+    dets.append(cv2.QRCodeDetector())
+    found = []
+    h, w = img.shape[:2]
+    tries = [(1.0, 0), (0.5, 0), (1.5, 0), (1.0, 20), (1.0, -20), (0.5, 20), (0.5, -20)]
+    for det in dets:
+        for scale, angle in tries:
+            im = img if scale == 1.0 else cv2.resize(img, None, fx=scale, fy=scale)
+            if angle:  # снимок под углом: поворачиваем и пробуем ещё раз
+                hh, ww = im.shape[:2]
+                M = cv2.getRotationMatrix2D((ww / 2, hh / 2), angle, 1.0)
+                im = cv2.warpAffine(im, M, (ww, hh), borderValue=(255, 255, 255))
+            try:
+                ok, texts, _, _ = det.detectAndDecodeMulti(im)
+            except cv2.error:
+                continue
+            if ok:
+                for t in texts:
+                    if t and t not in found:
+                        found.append(t)
+            if found:
+                return found
+    return found
+
+
+@main.message(F.text == BTN_SCAN)
+async def scan_help(m: Message, state: FSMContext, emp):
+    """Нажатие без мини-приложения сканера: объясняем, как сфотографировать QR."""
+    await state.clear()
+    await m.answer("📷 Сфотографируйте QR-код на оборудовании и отправьте фото сюда: нажмите скрепку 📎 → "
+                   "«Камера» (или значок камеры у поля ввода). Можно снять сразу несколько наклеек в кадре. "
+                   "Я отвечу, что распознала и добавила в список.\n\n"
+                   "Либо наведите обычную камеру телефона на QR: откроется бот и оборудование добавится.\n"
+                   "Номер можно ввести и вручную: «" + BTN_MANUAL + "».")
+
+
+@main.message(StateFilter(None), F.photo)
+async def photo_scan(m: Message, emp):
+    buf = await m.bot.download(m.photo[-1])
+    try:
+        texts = await run(decode_qr_photo, buf.getvalue())
+    except ImportError:
+        await m.answer("Распознавание фото не установлено. Администратору: "
+                       "в Терминале выполнить `pip install opencv-python-headless` и перезапустить бота. "
+                       "Пока можно сканировать обычной камерой телефона или ввести номер вручную.")
+        return
+    invs = []
+    for t in texts:
+        i = extract_inv(t)
+        if INV_RE.match(i) and i not in invs:
+            invs.append(i)
+    if not invs:
+        await m.answer("😕 QR-код оборудования на фото не нашла. Снимите ближе, чтобы код занимал большую часть "
+                       "кадра, без бликов и размытия, и отправьте снова. Либо введите номер: «" + BTN_MANUAL + "».")
+        return
+    await add_to_cart(m, m.from_user.id, invs)
+
+
 @main.message(F.web_app_data)
 async def scanned(m: Message, state: FSMContext, emp):
     await state.clear()
@@ -721,7 +791,7 @@ async def label_one(m: Message, command: CommandObject, emp):
         await m.answer("Использование: /label VA-0007")
         return
     png = make_label(eq[S.INV], eq[S.NAME], eq[S.BRAND], eq[S.BAL], BOT_USERNAME)
-    await m.answer_document(BufferedInputFile(png, f"{eq[S.INV]}.png"), caption="Этикетка 40×30 мм")
+    await m.answer_document(BufferedInputFile(png, f"{eq[S.INV]}.png"), caption=f"Этикетка {size_text()}")
 
 
 @main.message(Command("overdue"))
@@ -750,7 +820,7 @@ async def labels_all(m: Message, emp):
     await m.answer(f"Готовлю PDF на {len(items)} этикеток…")
     pdf = await run(make_pdf, items, BOT_USERNAME)
     await m.answer_document(BufferedInputFile(pdf, "labels.pdf"),
-                            caption="Все этикетки: одна на страницу, 40×30 мм")
+                            caption=f"Все этикетки: одна на страницу, {size_text()}")
 
 
 # ------------------------------------------------------------------ доступность и бронирование
@@ -1772,7 +1842,7 @@ async def new_save(cb: CallbackQuery, state: FSMContext, emp):
     png = make_label(inv, d["name"], d["brand"], d["balance"], BOT_USERNAME)
     await cb.message.answer_document(
         BufferedInputFile(png, f"{inv}.png"),
-        caption="Этикетка для печати (40×30 мм). Отправьте файл на мини-принтер и наклейте на оборудование.",
+        caption=f"Этикетка для печати ({size_text()}). Отправьте файл на мини-принтер и наклейте на оборудование.",
     )
     await cb.message.answer("Что дальше?", reply_markup=main_kb())
 

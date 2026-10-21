@@ -3,12 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сканер оборудования</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   body{font-family:-apple-system,Arial,sans-serif;margin:0;padding:16px;
        background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#000)}
-  h3{margin:0 0 8px}
-  ul{list-style:none;padding:0;margin:0 0 16px;max-height:45vh;overflow:auto}
+  h3{margin:0 0 10px}
+  #st{padding:14px 12px;border-radius:12px;margin-bottom:12px;font-size:17px;font-weight:600;
+      background:var(--tg-theme-secondary-bg-color,#f1f1f1)}
+  #st.ok{background:#d9f5df;color:#116329}
+  #st.dup{background:#fff1c9;color:#7a5200}
+  #st.bad{background:#ffdcdc;color:#9b1c1c}
+  ul{list-style:none;padding:0;margin:0 0 16px;max-height:40vh;overflow:auto}
   li{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;margin-bottom:6px;
      border-radius:10px;background:var(--tg-theme-secondary-bg-color,#f1f1f1)}
   li button{background:none;border:0;font-size:18px;color:var(--tg-theme-hint-color,#888)}
@@ -21,46 +27,75 @@
 </head>
 <body>
 <h3>Отсканировано: <span id="n">0</span></h3>
+<div id="st">Открываю камеру…</div>
 <ul id="list"></ul>
 <button class="btn sec" id="more">📷 Сканировать ещё</button>
 <button class="btn" id="done" disabled>Готово</button>
-<p id="hint">Наведите камеру на QR-код оборудования. После каждого кода камера откроется снова.</p>
+<p id="hint">Наведите камеру на QR-код. После каждого кода камера откроется снова. Когда закончите, нажмите «Готово»: список придёт в чат.</p>
 
 <script>
   const tg = Telegram.WebApp;
   tg.ready(); tg.expand();
   const codes = [];
+  const INV = /^[A-Z]{2,5}-\d{1,6}$/;
+  let isOpen = false, next = false;
 
+  function status(text, cls){
+    const s = document.getElementById("st");
+    s.textContent = text; s.className = cls || "";
+  }
   function clean(t){                       // из ссылки t.me/...?start=VA-0001 берём VA-0001
     const m = String(t).match(/start=([A-Za-z0-9_-]+)/);
     return (m ? m[1] : String(t)).trim().toUpperCase();
+  }
+  function haptic(kind){ try{ tg.HapticFeedback.notificationOccurred(kind); }catch(e){} }
+  function beep(){
+    try{
+      const a = new (window.AudioContext || window.webkitAudioContext)();
+      const o = a.createOscillator(); o.frequency.value = 880; o.connect(a.destination);
+      o.start(); setTimeout(() => { o.stop(); a.close(); }, 120);
+    }catch(e){}
   }
   function render(){
     document.getElementById("n").textContent = codes.length;
     const ul = document.getElementById("list"); ul.innerHTML = "";
     codes.forEach((c, i) => {
       const li = document.createElement("li");
-      li.textContent = c;
+      li.textContent = "✓ " + c;
       const b = document.createElement("button"); b.textContent = "✖";
-      b.onclick = () => { codes.splice(i, 1); render(); };
+      b.onclick = () => { codes.splice(i, 1); render(); status("Убрано: " + c); };
       li.appendChild(b); ul.appendChild(li);
     });
     const d = document.getElementById("done");
     d.disabled = codes.length === 0;
     d.textContent = codes.length ? "Готово (" + codes.length + ")" : "Готово";
   }
+  function handle(text){
+    const c = clean(text);
+    if (!INV.test(c)) { status("Это не QR оборудования: " + String(text).slice(0, 30), "bad"); haptic("error"); return; }
+    if (codes.includes(c)) { status(c + " уже в списке", "dup"); haptic("warning"); return; }
+    codes.push(c);
+    status("✓ " + c + " добавлено. Наведите на следующее или нажмите «Готово»", "ok");
+    haptic("success"); beep();
+  }
   function scan(){
+    if (isOpen) return;
+    if (!tg.showScanQrPopup) { status("Обновите Telegram: в этой версии нет сканера", "bad"); return; }
+    isOpen = true; next = false;
     try {
       tg.showScanQrPopup({text: codes.length ? "Отсканировано: " + codes.length + ". Наведите на следующее"
                                               : "Наведите на QR оборудования"}, function(text){
-        const c = clean(text);
-        if (c && !codes.includes(c)) { codes.push(c); try{ tg.HapticFeedback.notificationOccurred("success"); }catch(e){} }
-        render();
-        setTimeout(scan, 450);             // сразу открываем камеру для следующего
+        handle(text); render();
+        next = true;
+        setTimeout(scan, 600);             // сразу открываем камеру для следующего
         return true;                       // закрыть текущее окно сканера
       });
-    } catch(e) {}
+    } catch(e) { isOpen = false; status("Не удалось открыть камеру: " + e, "bad"); }
   }
+  tg.onEvent("scanQrPopupClosed", function(){
+    isOpen = false;
+    if (!next) status(codes.length ? "Камера закрыта. Сканируйте ещё или нажмите «Готово»" : "Камера закрыта. Нажмите «Сканировать ещё»");
+  });
   document.getElementById("more").onclick = scan;
   document.getElementById("done").onclick = () => tg.sendData(JSON.stringify(codes));
   render(); scan();

@@ -3,3 +3,4 @@ gspread>=6.1
 python-dotenv>=1.0
 segno>=1.6
 Pillow>=10.1
+opencv-python-headless
